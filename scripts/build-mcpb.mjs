@@ -56,6 +56,17 @@ const IS_MONOREPO =
   path.basename(path.dirname(PKG_DIR)) === "packages" &&
   existsSync(path.join(MONOREPO_ROOT, "package.json"));
 
+// Where the canonical registry/schemas/profiles for the bundle live:
+//   - monorepo: the repo ROOT holds the canonical assets. The SDK build copies
+//     them into the SDK package (copy-assets.mjs), but that only runs on a
+//     rebuild — and we skip the rebuild when dist already exists — so reading
+//     the SDK package copy could bundle stale data in a reused checkout. Read
+//     the root copy directly so the .mcpb always reflects the canonical assets.
+//   - standalone: there is no repo root; the installed @sequesign/sdk package
+//     ships these dirs in its "files", and that copy IS canonical for the
+//     published SDK version being bundled.
+const ASSET_DIR = IS_MONOREPO ? MONOREPO_ROOT : SDK_DIR;
+
 const OUT_DIR = path.join(PKG_DIR, "mcpb-dist");
 const SERVER_DIR = path.join(OUT_DIR, "server");
 
@@ -110,15 +121,17 @@ async function main() {
     JSON.stringify({ name: "sequesign-mcp-bundle", private: true, type: "module" }, null, 2) + "\n"
   );
 
-  // The SDK's runtime data, copied from the resolved @sequesign/sdk package
-  // (which ships these dirs in its "files"). Placed next to server/package.json
-  // so PROJECT_ROOT resolves here and resolveAsset finds it.
+  // The SDK's runtime data, copied from the canonical source for this layout
+  // (see ASSET_DIR). Placed next to server/package.json so PROJECT_ROOT resolves
+  // here and resolveAsset finds it.
   for (const dir of ["registry", "schemas", "profiles"]) {
-    const from = path.join(SDK_DIR, dir);
+    const from = path.join(ASSET_DIR, dir);
     if (!existsSync(from)) {
       throw new Error(
-        `@sequesign/sdk is missing ${dir}/ at ${from}; cannot stage the .mcpb assets. ` +
-          "(The published SDK ships registry/schemas/profiles; reinstall it.)"
+        `missing ${dir}/ at ${from}; cannot stage the .mcpb assets. ` +
+          (IS_MONOREPO
+            ? "(Expected the canonical assets at the monorepo root.)"
+            : "(The published @sequesign/sdk ships registry/schemas/profiles; reinstall it.)")
       );
     }
     await cp(from, path.join(SERVER_DIR, dir), { recursive: true });
