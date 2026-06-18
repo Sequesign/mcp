@@ -1,0 +1,46 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Sequesign/sequesign",
+  "title": "Sequesign",
+  "description": "Produce cryptographically verifiable receipts of an agent's delegated work, then verify them offline.",
+  "version": "0.1.0",
+  "repository": {
+    "url": "https://github.com/Sequesign/mcp",
+    "source": "github"
+  },
+  "websiteUrl": "https://sequesign.com",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@sequesign/mcp",
+      "version": "0.1.0",
+      "transport": { "type": "stdio" },
+      "runtimeHint": "npx",
+      "environmentVariables": [
+        {
+          "name": "SEQUESIGN_MODE",
+          "description": "Transport: 'direct' (default; sign locally, an independent witness co-signs) or 'managed' (route through the Sequesign broker for a registered identity).",
+          "isRequired": false
+        },
+        {
+          "name": "SEQUESIGN_API_KEY",
+          "description": "Sequesign write-class API key (from the dashboard). Required for managed mode; in direct mode it authenticates the hosted witness.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "SEQUESIGN_AGENT_PRIVATE_KEY",
+          "description": "Ed25519 PKCS#8 private-key PEM for the agent. In managed mode, the key registered to your API key. In direct mode, omit to mint an ephemeral key per session.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "SEQUESIGN_PACKAGE_DIR",
+          "description": "Directory where sealed receipt packages are written. Defaults to a temporary directory.",
+          "isRequired": false
+        }
+      ]
+    }
+  ]
+}

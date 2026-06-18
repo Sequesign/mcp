@@ -1,0 +1,61 @@
+# Publish @sequesign/mcp to npm (with provenance) and register it in the
+# official MCP registry (modelcontextprotocol.io) via GitHub OIDC.
+#
+# THIS WORKFLOW IS FOR THE STANDALONE `Sequesign/mcp` REPOSITORY, where this
+# package sits at the repo root (it is mirrored there from the Sequesign
+# monorepo's packages/sequesign-mcp). It is intentionally NOT at the monorepo
+# root, so it does not run in the monorepo.
+#
+# Prerequisites (see PUBLISHING.md):
+#   - @sequesign/sdk@<the version this package depends on> is ALREADY on npm
+#     (published from its own pipeline) — npm ci/build/publish here needs it;
+#   - the `@sequesign` npm scope + an `NPM_TOKEN` repo secret (or npm Trusted
+#     Publishing configured for this repo/workflow, which drops the token);
+#   - the `io.github.Sequesign/*` registry namespace is proven automatically by
+#     `mcp-publisher login github-oidc` (same GitHub org → no DNS/secret).
+
+name: Publish MCP server
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write # OIDC: npm provenance + MCP registry login
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      # npm >= 11.5.1 for provenance / trusted publishing.
+      - run: npm install -g npm@latest
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: Publish to npm (with provenance)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public
+
+      # Register server.json in the official MCP registry. The npm package must
+      # already be live (above) and carry the matching `mcpName` field; the
+      # registry verifies it against server.json's `name`.
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      - name: Publish to the MCP registry (GitHub OIDC)
+        run: |
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish
