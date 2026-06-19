@@ -215,8 +215,28 @@ function mintKeypair(): KeyMaterial {
   };
 }
 
-// Derive the full keypair from a private-key PEM, validating it is Ed25519.
-function keypairFromPrivatePem(label: string, pem: string): KeyMaterial {
+// Normalize a pasted private-key PEM into canonical form. Config UIs — notably
+// the Claude Desktop extension's user_config form — often collapse a multi-line
+// secret onto one line or keep literal "\n", which makes OpenSSL reject it with
+// BAD_END_LINE. Rather than force users to reference a file, we reconstruct the
+// PEM from whatever arrives: turn literal \n/\r back into newlines, then re-wrap
+// the base64 body between the BEGIN/END markers at 64 columns. A correctly
+// formatted multi-line PEM round-trips unchanged.
+function normalizePem(raw: string): string {
+  const s = raw.trim().replace(/\\r\\n|\\n|\\r/g, "\n");
+  const m = s.match(/-----BEGIN ([A-Z0-9 ]+?)-----([\s\S]*?)-----END [A-Z0-9 ]+?-----/);
+  if (!m) return s; // not PEM-shaped — let the parser raise its own error
+  const label = m[1].trim();
+  const body = (m[2].match(/[A-Za-z0-9+/=]/g) ?? []).join("");
+  const wrapped = body.match(/.{1,64}/g)?.join("\n") ?? "";
+  return `-----BEGIN ${label}-----\n${wrapped}\n-----END ${label}-----\n`;
+}
+
+// Derive the full keypair from a private-key PEM, validating it is Ed25519. The
+// PEM is normalized first so a key pasted into a single-line config field (with
+// newlines stripped or escaped) still parses.
+function keypairFromPrivatePem(label: string, rawPem: string): KeyMaterial {
+  const pem = normalizePem(rawPem);
   if (!pem.includes("PRIVATE KEY")) {
     throw new Error(`${label} is not an Ed25519 private-key PEM.`);
   }

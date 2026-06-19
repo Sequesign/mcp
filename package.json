@@ -1,6 +1,6 @@
 {
   "name": "@sequesign/mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "mcpName": "io.github.Sequesign/sequesign",
   "description": "Model Context Protocol (MCP) server for Sequesign — expose cryptographically verifiable receipts of delegated AI work as MCP tools. A thin local-stdio wrapper over @sequesign/sdk; the agent key never leaves the machine.",
   "license": "Apache-2.0",
