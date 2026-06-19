@@ -31,6 +31,8 @@
 
 import { mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import path from "node:path";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import {
   createPrivateKey,
@@ -61,6 +63,31 @@ import {
   parseTrustedWitnessKeys,
   parseTrustedRegistrationKeys
 } from "@sequesign/sdk/verify";
+
+// The version reported to MCP clients via server info. Derived from the nearest
+// package.json (walking up from this module) so it tracks the published version
+// and can never drift from package.json/server.json the way a hard-coded literal
+// did. Works in both layouts: the npm package (dist/index.js → package root's
+// package.json) and the bundled .mcpb (server/index.js → the stub package.json,
+// into which build-mcpb writes the release version).
+function resolveServerVersion(): string {
+  let dir = path.dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < 8; i++) {
+    try {
+      const pkg = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8")) as {
+        version?: string;
+      };
+      if (typeof pkg.version === "string" && pkg.version.length > 0) return pkg.version;
+    } catch {
+      /* no package.json here — keep walking up */
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return "0.0.0";
+}
+const SERVER_VERSION = resolveServerVersion();
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -467,7 +494,7 @@ async function main(): Promise<void> {
 
   const server = new McpServer({
     name: "sequesign",
-    version: "0.1.0"
+    version: SERVER_VERSION
   });
 
   server.registerTool(

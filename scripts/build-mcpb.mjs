@@ -39,6 +39,7 @@ import esbuild from "esbuild";
 
 const require = createRequire(import.meta.url);
 const PKG_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+const PKG_VERSION = JSON.parse(readFileSync(path.join(PKG_DIR, "package.json"), "utf8")).version ?? "0.0.0";
 
 // Resolve the installed @sequesign/sdk package root. Works in both layouts: the
 // standalone repo resolves to node_modules/@sequesign/sdk; the monorepo follows
@@ -118,7 +119,11 @@ async function main() {
   // and marks the emitted .js as ESM.
   await writeFile(
     path.join(SERVER_DIR, "package.json"),
-    JSON.stringify({ name: "sequesign-mcp-bundle", private: true, type: "module" }, null, 2) + "\n"
+    JSON.stringify(
+      { name: "sequesign-mcp-bundle", version: PKG_VERSION, private: true, type: "module" },
+      null,
+      2
+    ) + "\n"
   );
 
   // The SDK's runtime data, copied from the canonical source for this layout

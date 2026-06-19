@@ -3,7 +3,7 @@
   "manifest_version": "0.3",
   "name": "sequesign",
   "display_name": "Sequesign",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Cryptographically verifiable receipts of an agent's delegated work, verified offline.",
   "long_description": "Sequesign turns an MCP-capable agent into one that can prove what it did. It opens a signed action chain, records each action (the evidence is hashed and signed), and seals the result into a receipt that an independent witness co-signs. The agent's signing key never leaves the machine — in direct mode the witness only co-signs a hash. Receipts verify offline, support multi-party approval and counterparty attestations, and can be checked against the broker-stored, registered-identity copy.",
   "author": {
