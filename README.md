@@ -103,7 +103,7 @@ All configuration is via environment variables:
 ### As a Claude Desktop Extension (`.mcpb`) — recommended
 
 The one-click path: download `sequesign.mcpb` from the
-[GitHub releases](https://github.com/Sequesign/Sequesign/releases) and open it
+[GitHub releases](https://github.com/Sequesign/mcp/releases) and open it
 with Claude Desktop (Settings → Extensions → install from file). Desktop renders
 a setup form from the manifest's `user_config`; fill in:
 
