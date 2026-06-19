@@ -46,10 +46,17 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-import { createSequesign } from "@sequesign/sdk";
+import {
+  createSequesign,
+  loadProfileById,
+  loadSchemaByActionType,
+  loadSchemaById
+} from "@sequesign/sdk";
 import type {
   AgentActionReceipt,
   KeyMaterial,
+  ProfileReference,
+  ReceiptMode,
   RecordedAction,
   Sdk,
   Session,
@@ -297,6 +304,10 @@ function resolvePartyKeypair(
 interface OpenSession {
   session: Session;
   packageDirectory: string;
+  // The session's receipt mode. In schema_validated / profile_constrained mode,
+  // record_action must attach the per-action schemaId+schemaHash; freeform does
+  // not. Captured at start_session so record_action knows which applies.
+  mode: ReceiptMode;
   // Per-session serialization tail. The MCP transport can have multiple
   // tool calls in flight at once, and the SDK reads sequenceNext /
   // currentChainState *before* awaiting the witness — so two overlapping
@@ -529,6 +540,12 @@ async function main(): Promise<void> {
           .optional()
           .describe(
             "Override the server's default transport for this session. 'direct' signs locally and the independent witness co-signs (self_asserted identity, you keep the envelope). 'managed' routes through the broker (registered identity, broker-stored). Defaults to SEQUESIGN_MODE."
+          ),
+        profile: z
+          .string()
+          .optional()
+          .describe(
+            "Registered workflow profile id (e.g. 'sequesign.invoice_payment.v0.1') to bind this receipt to. When set, the session records in profile_constrained mode: each action must be a registered action type whose evidence validates against its JSON Schema, and the chain must satisfy the profile's required actions/transitions — reaching schema_valid + workflow_profile_valid. Omit for a freeform receipt (the default)."
           )
       }
     },
@@ -544,6 +561,23 @@ async function main(): Promise<void> {
         const agentKeypair = config.agentPrivateKeyPem
           ? keypairFromPrivatePem("SEQUESIGN_AGENT_PRIVATE_KEY", config.agentPrivateKeyPem)
           : mintKeypair();
+
+        // Optional workflow profile → profile_constrained recording. Resolve the
+        // profile id to its canonical { profile_id, profile_hash } from the
+        // bundled registry (the SDK's schema policy verifies that hash and each
+        // action's schema). No profile → freeform (the default, unchanged).
+        let receiptMode: ReceiptMode = "freeform";
+        let profileRef: ProfileReference | undefined;
+        if (args.profile) {
+          const loaded = await loadProfileById(args.profile);
+          if (!loaded) {
+            throw new Error(
+              `Unknown profile "${args.profile}". It must be a profile_id in the bundled registry (e.g. "sequesign.invoice_payment.v0.1").`
+            );
+          }
+          receiptMode = "profile_constrained";
+          profileRef = { profile_id: loaded.profileId, profile_hash: loaded.profileHash };
+        }
 
         await mkdir(config.packageBaseDir, { recursive: true });
         const safeTask = args.taskId.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 80);
@@ -561,11 +595,8 @@ async function main(): Promise<void> {
               ? { policyContextHash: policyContextHash(args.policyContext) }
               : {})
           },
-          // v1 records freeform receipts only. The SDK's schema_validated /
-          // profile_constrained modes need a profile (at startSession) and
-          // per-action schemaId/schemaHash that these tools do not yet accept,
-          // so exposing them would only fail; add them when those inputs land.
-          mode: "freeform",
+          mode: receiptMode,
+          ...(profileRef ? { profile: profileRef } : {}),
           package: { directory: packageDirectory, ifExists: "fail" }
         };
         if (effectiveMode === "direct") {
@@ -581,6 +612,7 @@ async function main(): Promise<void> {
         sessions.set(session.receiptId, {
           session,
           packageDirectory,
+          mode: session.mode,
           queue: Promise.resolve()
         });
 
@@ -635,19 +667,44 @@ async function main(): Promise<void> {
         metadata: z
           .record(z.unknown())
           .optional()
-          .describe("Optional non-signed-over metadata (e.g. agent reasoning).")
+          .describe("Optional non-signed-over metadata (e.g. agent reasoning)."),
+        schemaId: z
+          .string()
+          .optional()
+          .describe(
+            "Override the registered schema for this action (a schema_id). Only used when the session is schema/profile-bound; by default the schema is resolved from actionType. Ignored for freeform sessions."
+          )
       }
     },
     async (args) => {
       try {
         const open = requireSession(args.sessionId);
+        // Schema/profile-bound sessions require a per-action schemaId+schemaHash,
+        // verified against the bundled registry. Resolve from an explicit
+        // schemaId override, else from the action type. Freeform sessions skip
+        // this entirely (the schema fields stay undefined).
+        let schemaFields: { schemaId?: string; schemaHash?: string } = {};
+        if (open.mode === "profile_constrained" || open.mode === "schema_validated") {
+          const loaded = args.schemaId
+            ? await loadSchemaById(args.schemaId)
+            : await loadSchemaByActionType(args.actionType);
+          if (!loaded) {
+            throw new Error(
+              `No registered schema for ${
+                args.schemaId ? `schema_id "${args.schemaId}"` : `action type "${args.actionType}"`
+              }; ${open.mode} mode requires every action to carry a registered schema.`
+            );
+          }
+          schemaFields = { schemaId: loaded.schemaId, schemaHash: loaded.schemaHash };
+        }
         const recorded: RecordedAction = await runExclusive(open, () =>
           open.session.recordAction({
             actionType: args.actionType,
             evidence: args.evidence,
             verifiabilityClass:
               (args.verifiabilityClass as VerifiabilityClass | undefined) ?? "deterministic",
-            metadata: args.metadata
+            metadata: args.metadata,
+            ...schemaFields
           })
         );
         return ok({
@@ -655,7 +712,8 @@ async function main(): Promise<void> {
           actionType: recorded.actionType,
           sequence: recorded.sequence,
           evidenceHash: recorded.evidenceHash,
-          chainState: recorded.chainState
+          chainState: recorded.chainState,
+          ...(schemaFields.schemaId ? { schemaId: schemaFields.schemaId } : {})
         });
       } catch (error) {
         return fail(error);
