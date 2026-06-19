@@ -1068,7 +1068,7 @@ async function main(): Promise<void> {
         openWorldHint: true
       },
       description:
-        "Verify a sealed Sequesign receipt. Three modes: (1) default — an integrity self-check of the local package (trust anchor is the receipt's own embedded witness keys); (2) pass trustedWitnessKeysJson for a third-party 'external' trust check; (3) pass receiptUrl to verify the broker-STORED receipt (the authoritative copy that carries the registered agent_identity_attestation), auto-fetching the published witness + registration anchors so the result shows external trust AND the registered identity. receiptUrl still needs packageDirectory (the stored envelope is verified against the package's evidence/keys).",
+        "Verify a sealed Sequesign receipt. Modes: (1) default — an integrity self-check of the local package (trust anchor is the receipt's own embedded witness keys); (2) pass trustedWitnessKeysJson and/or trustedRegistrationKeysJson for a third-party 'external' trust check and registered-identity promotion; (3) set fetchAnchors:true to auto-fetch those witness + registration anchors from the configured well-knowns (so a local direct-mode receipt reports external trust and a registered identity without pasting JSON); (4) pass receiptUrl to verify the broker-STORED receipt (the authoritative copy that carries the registered agent_identity_attestation), auto-fetching the anchors. receiptUrl still needs packageDirectory (the stored envelope is verified against the package's evidence/keys).",
       inputSchema: {
         packageDirectory: z
           .string()
@@ -1090,6 +1090,12 @@ async function main(): Promise<void> {
           .optional()
           .describe(
             "Contents of the platform's published registration-keys.json, to flip the agent/approver/counterparty legs to verified. With receiptUrl it overrides the auto-fetched registration anchors."
+          ),
+        fetchAnchors: z
+          .boolean()
+          .optional()
+          .describe(
+            "Local verify only (ignored with receiptUrl): auto-fetch the witness keys and platform registration-keys from the configured SEQUESIGN_WITNESS_URL / SEQUESIGN_DASHBOARD_API_URL well-knowns, so the result surfaces external witness trust and the registered agent/approver/counterparty identity without pasting JSON. Explicit trustedWitnessKeysJson / trustedRegistrationKeysJson override the matching fetch. Best-effort: an unreachable endpoint falls back (witness → self; registration → leg not promoted) and is noted in the result. Default false = fully offline self-check."
           )
       }
     },
@@ -1159,32 +1165,73 @@ async function main(): Promise<void> {
           }
         }
 
-        const trustedRegistrationKeys = args.trustedRegistrationKeysJson
-          ? parseTrustedRegistrationKeys(args.trustedRegistrationKeysJson)
-          : undefined;
+        // Local-package verify (no receiptUrl). Default: a fully offline
+        // self-check anchored on the receipt's own embedded witness keys.
+        // Explicit trusted*KeysJson — or fetchAnchors, which pulls the witness +
+        // registration well-knowns from the configured URLs — promote the trust
+        // and identity legs without the caller pasting key JSON.
 
-        let report: VerificationReport;
+        // Registration anchor (flips agent/approver/counterparty → registered).
+        let trustedRegistrationKeys;
+        let registrationAnchor = "not_requested";
+        if (args.trustedRegistrationKeysJson) {
+          // Explicit intent → malformed input fails loudly.
+          trustedRegistrationKeys = parseTrustedRegistrationKeys(args.trustedRegistrationKeysJson);
+          registrationAnchor = "applied";
+        } else if (args.fetchAnchors) {
+          // Best-effort: a down endpoint leaves integrity/witness intact; the
+          // identity leg simply isn't promoted.
+          try {
+            trustedRegistrationKeys = parseTrustedRegistrationKeys(
+              await fetchText(
+                `${config.dashboardApiUrl}/.well-known/sequesign/registration-keys.json`
+              )
+            );
+            registrationAnchor = "applied";
+          } catch (regError) {
+            registrationAnchor = `unavailable (${
+              regError instanceof Error ? regError.message : String(regError)
+            })`;
+          }
+        }
+
+        // Witness anchor (flips trust_anchor_mode self → external).
+        let trustedWitnessKeys;
+        let trustAnchorMode: "self" | "external" = "self";
         if (args.trustedWitnessKeysJson) {
-          report = await verifyReceiptPackage(args.packageDirectory, {
-            trustedWitnessKeys: parseTrustedWitnessKeys(args.trustedWitnessKeysJson),
-            trustAnchorMode: "external",
-            ...(trustedRegistrationKeys ? { trustedRegistrationKeys } : {})
-          });
-        } else {
-          // Self-check: anchor on the receipt's own embedded witness keys.
+          trustedWitnessKeys = parseTrustedWitnessKeys(args.trustedWitnessKeysJson);
+          trustAnchorMode = "external";
+        } else if (args.fetchAnchors) {
+          try {
+            trustedWitnessKeys = parseTrustedWitnessKeys(
+              await fetchText(`${config.witnessUrl}/.well-known/sequesign/keys.json`)
+            );
+            trustAnchorMode = "external";
+          } catch {
+            // Witness well-known unreachable → fall back to embedded self-trust
+            // below; any fetched registration anchor still promotes identity.
+          }
+        }
+        if (!trustedWitnessKeys) {
           const receipt = JSON.parse(
             await readFile(path.join(args.packageDirectory, "receipt.json"), "utf8")
           );
-          report = await verifyReceiptPackage(args.packageDirectory, {
-            trustedWitnessKeys: witnessKeysFromReceipt(receipt),
-            trustAnchorMode: "self",
-            ...(trustedRegistrationKeys ? { trustedRegistrationKeys } : {})
-          });
+          trustedWitnessKeys = witnessKeysFromReceipt(receipt);
+          trustAnchorMode = "self";
         }
+
+        const report: VerificationReport = await verifyReceiptPackage(args.packageDirectory, {
+          trustedWitnessKeys,
+          trustAnchorMode,
+          ...(trustedRegistrationKeys ? { trustedRegistrationKeys } : {})
+        });
 
         return ok({
           source: "local_package",
-          self_check: !args.trustedWitnessKeysJson,
+          self_check: trustAnchorMode === "self",
+          ...(args.fetchAnchors || args.trustedRegistrationKeysJson
+            ? { registration_anchor: registrationAnchor }
+            : {}),
           ...summarizeVerification(report)
         });
       } catch (error) {
