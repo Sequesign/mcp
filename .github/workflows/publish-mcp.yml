@@ -43,10 +43,19 @@ jobs:
       - run: npm ci
       - run: npm run build
 
+      # Idempotent: if this exact version is already on npm (e.g. a re-run to
+      # (re)publish the MCP registry metadata after the npm publish already
+      # succeeded), skip the npm publish instead of failing on a version clash.
       - name: Publish to npm (with provenance)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --provenance --access public
+        run: |
+          VER="$(node -p "require('./package.json').version")"
+          if npm view "@sequesign/mcp@${VER}" version >/dev/null 2>&1; then
+            echo "@sequesign/mcp@${VER} already published — skipping npm publish."
+          else
+            npm publish --provenance --access public
+          fi
 
       # Register server.json in the official MCP registry. The npm package must
       # already be live (above) and carry the matching `mcpName` field; the
