@@ -695,6 +695,18 @@ async function main(): Promise<void> {
               }; ${open.mode} mode requires every action to carry a registered schema.`
             );
           }
+          // The action is recorded under args.actionType, but workflow-profile
+          // validation keys off that action_type while evidence is validated
+          // against the resolved schema. If an explicit schemaId resolves to a
+          // schema registered for a *different* action type, the two disagree:
+          // evidence would be checked against the wrong schema while the chain
+          // still satisfies the profile's requirement for args.actionType. Reject
+          // the mismatch so a schema can never be silently bound to the wrong action.
+          if (args.schemaId && loaded.actionType !== args.actionType) {
+            throw new Error(
+              `schema_id "${args.schemaId}" is registered for action type "${loaded.actionType}", not "${args.actionType}". A schema override must match the action being recorded; omit schemaId to auto-resolve the schema for "${args.actionType}".`
+            );
+          }
           schemaFields = { schemaId: loaded.schemaId, schemaHash: loaded.schemaHash };
         }
         const recorded: RecordedAction = await runExclusive(open, () =>
