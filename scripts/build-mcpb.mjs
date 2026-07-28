@@ -39,7 +39,8 @@ import esbuild from "esbuild";
 
 const require = createRequire(import.meta.url);
 const PKG_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
-const PKG_VERSION = JSON.parse(readFileSync(path.join(PKG_DIR, "package.json"), "utf8")).version ?? "0.0.0";
+const PKG_VERSION =
+  JSON.parse(readFileSync(path.join(PKG_DIR, "package.json"), "utf8")).version ?? "0.0.0";
 
 // Resolve the installed @sequesign/sdk package root. Works in both layouts: the
 // standalone repo resolves to node_modules/@sequesign/sdk; the monorepo follows

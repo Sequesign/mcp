@@ -1,15 +1,25 @@
 #!/usr/bin/env node
 // Sequesign MCP server (v1) — a thin local-stdio wrapper over @sequesign/sdk.
 //
-// Exposes six tools so an MCP-capable agent can produce a cryptographically
-// verifiable receipt of its own delegated work, then verify it offline:
+// Exposes tools so an MCP-capable agent can discover a workflow template,
+// produce a cryptographically verifiable receipt of its own delegated work,
+// then verify it offline:
 //
+//   sequesign_list_templates                 browse the bundled workflow templates
+//   sequesign_get_template                   fetch one template's full definition
+//   sequesign_check_action                   pre-flight an action against a template
 //   sequesign_start_session                  open a recording session (a chain)
 //   sequesign_record_action                  append a signed action to the chain
 //   sequesign_record_approval                attach a (locally signed) approval
 //   sequesign_record_counterparty_attestation attach a counterparty confirmation
+//   sequesign_approve_receipt                approve a sealed receipt (satellite)
+//   sequesign_countersign_receipt            countersign a sealed receipt (satellite)
 //   sequesign_finalize                       seal + witness the receipt
 //   sequesign_verify                         verify a sealed package offline
+//
+// The template tools (list/get/check_action, Phase 6) are read-only and fully
+// offline — they read the bundled registry and evaluate the pure mandate
+// substrate; they touch no session state, network, or secrets.
 //
 // The agent key never leaves the machine: in direct mode the SDK signs each
 // action locally and the hosted witness only co-signs a hash. Session state is
@@ -49,8 +59,11 @@ import { z } from "zod";
 import {
   createSequesign,
   loadProfileById,
+  loadManifest,
   loadSchemaByActionType,
-  loadSchemaById
+  loadSchemaById,
+  resolveTemplateTier,
+  checkAction
 } from "@sequesign/sdk";
 import type {
   AgentActionReceipt,
@@ -68,7 +81,8 @@ import {
   verifyReceiptPackage,
   witnessKeysFromReceipt,
   parseTrustedWitnessKeys,
-  parseTrustedRegistrationKeys
+  parseTrustedRegistrationKeys,
+  parseTrustedAuthorKeys
 } from "@sequesign/sdk/verify";
 
 // The version reported to MCP clients via server info. Derived from the nearest
@@ -146,9 +160,7 @@ function assertTrustedReceiptUrl(rawUrl: string, config: Config): URL {
 // to succeed and then failing at the first recordAction/finalize.
 function assertManagedReady(config: Config): void {
   if (!config.apiKey) {
-    throw new Error(
-      "managed mode requires SEQUESIGN_API_KEY (a write-class API key)."
-    );
+    throw new Error("managed mode requires SEQUESIGN_API_KEY (a write-class API key).");
   }
   if (!config.agentPrivateKeyPem) {
     throw new Error(
@@ -165,9 +177,7 @@ function assertManagedReady(config: Config): void {
 // assertManagedReady (it signs actions with the registered agent key).
 function assertManagedBrokerConfigured(config: Config): void {
   if (!config.apiKey) {
-    throw new Error(
-      "managed mode requires SEQUESIGN_API_KEY to seal a satellite via the broker."
-    );
+    throw new Error("managed mode requires SEQUESIGN_API_KEY to seal a satellite via the broker.");
   }
 }
 
@@ -449,7 +459,28 @@ function summarizeVerification(report: VerificationReport) {
     trust_anchor_mode: report.trust_anchor_mode,
     flags: report.flags,
     identity_assurance: report.identity_assurance ?? null,
-    agent_identity: report.agent_identity?.kind ?? null
+    agent_identity: report.agent_identity?.kind ?? null,
+    // Phase 4: the mandate/conformance axis, distinct from `valid`. `conformant`
+    // is whether the sealed work obeyed the profile-constrained mandate
+    // (workflow shape + parameterized evidence constraints); a nonconformant
+    // receipt is still valid:true (authentic) with conformant:false. null when
+    // not applicable (freeform receipt).
+    conformant: report.conformant ?? null,
+    mandate: report.conformance
+      ? {
+          conformant: report.conformance.conformant,
+          violations: report.conformance.violations,
+          profile_resolved_from: report.conformance.profile_resolved_from,
+          profile_id: report.profile?.profile_id ?? null,
+          profile_hash_verified: report.profile?.profile_hash_verified ?? null
+        }
+      : null,
+    // Phase 5: WHO vouches for the mandate rules, an axis distinct from whether
+    // the rules are intact (mandate.profile_hash_verified) and from conformance.
+    // "attested" carries the vouching author's id; "unrecognized"/"unattested"
+    // confer no author trust. null when not applicable (freeform / non-V1).
+    template_authenticity: report.template_authenticity ?? null,
+    template_author: report.template_author?.author_id ?? null
   };
 }
 
@@ -481,6 +512,25 @@ async function fetchText(url: string, apiKey?: string): Promise<string> {
     throw error;
   } finally {
     clearTimeout(timer);
+  }
+}
+
+// Template system Phase 5: best-effort fetch of the platform's published
+// template-author keys (dashboard-api /.well-known/sequesign/author-keys.json),
+// so verification can grade template_authenticity "attested". Best-effort by
+// design: a down endpoint, or an empty document (no authors configured, which
+// parseTrustedAuthorKeys rejects), returns undefined and the grade stays
+// unrecognized/unattested — it never fails the receipt.
+async function fetchAuthorAnchor(
+  config: { dashboardApiUrl: string },
+  fetch: (url: string, apiKey?: string) => Promise<string>
+): Promise<ReturnType<typeof parseTrustedAuthorKeys> | undefined> {
+  try {
+    return parseTrustedAuthorKeys(
+      await fetch(`${config.dashboardApiUrl}/.well-known/sequesign/author-keys.json`)
+    );
+  } catch {
+    return undefined;
   }
 }
 
@@ -545,7 +595,13 @@ async function main(): Promise<void> {
           .string()
           .optional()
           .describe(
-            "Registered workflow profile id (e.g. 'sequesign.invoice_payment.v0.1') to bind this receipt to. When set, the session records in profile_constrained mode: each action must be a registered action type whose evidence validates against its JSON Schema, and the chain must satisfy the profile's required actions/transitions — reaching schema_valid + workflow_profile_valid. Omit for a freeform receipt (the default)."
+            "Registered workflow template to bind this receipt to, given by its profile_id (e.g. 'sequesign.invoice_payment.v0.1'). When set, the session records in profile_constrained mode: each action must be a registered action type whose evidence validates against its JSON Schema, and the chain must satisfy the template's required actions/transitions — reaching schema_valid + workflow_profile_valid. Omit for a freeform receipt (the default)."
+          ),
+        params: z
+          .record(z.any())
+          .optional()
+          .describe(
+            "Bind concrete values to a parameterized template's `parameters` (e.g. { max_amount: 5000 }). Requires `profile`, and that template must declare usable parameters. When supplied, the values are committed into the chain genesis (params_hash / SEQUESIGN_GENESIS_V1) so the template's parameterized evidence constraints apply and travel in the receipt. Use sequesign_list_templates / sequesign_check_action to learn a template's parameters and pre-flight them first. Omit for an unparameterized (V0) session."
           )
       }
     },
@@ -572,11 +628,19 @@ async function main(): Promise<void> {
           const loaded = await loadProfileById(args.profile);
           if (!loaded) {
             throw new Error(
-              `Unknown profile "${args.profile}". It must be a profile_id in the bundled registry (e.g. "sequesign.invoice_payment.v0.1").`
+              `Unknown template "${args.profile}". It must be a registered template's profile_id in the bundled registry (e.g. "sequesign.invoice_payment.v0.1").`
             );
           }
           receiptMode = "profile_constrained";
           profileRef = { profile_id: loaded.profileId, profile_hash: loaded.profileHash };
+        }
+        // Parameters bind to a profile: reject params without one up front with a
+        // clear message (the SDK also enforces this, but a pre-check reads better
+        // than a downstream binding error).
+        if (args.params !== undefined && !profileRef) {
+          throw new Error(
+            "`params` requires `profile`: parameters bind to a parameterized workflow template. Pass the template's profile id, or omit params."
+          );
         }
 
         await mkdir(config.packageBaseDir, { recursive: true });
@@ -597,6 +661,7 @@ async function main(): Promise<void> {
           },
           mode: receiptMode,
           ...(profileRef ? { profile: profileRef } : {}),
+          ...(args.params !== undefined ? { params: args.params } : {}),
           package: { directory: packageDirectory, ifExists: "fail" }
         };
         if (effectiveMode === "direct") {
@@ -625,7 +690,8 @@ async function main(): Promise<void> {
           // happens in direct mode with no SEQUESIGN_AGENT_PRIVATE_KEY set.
           ephemeral_agent_key: effectiveMode === "direct" && !config.agentPrivateKeyPem,
           package_directory: packageDirectory,
-          policy_bound: Boolean(args.policyContext)
+          policy_bound: Boolean(args.policyContext),
+          parameterized: args.params !== undefined
         });
       } catch (error) {
         return fail(error);
@@ -749,7 +815,9 @@ async function main(): Promise<void> {
         sessionId: z.string().describe("The receiptId returned by sequesign_start_session."),
         approverId: z
           .string()
-          .describe("Identity of the approver (lowercase email or label, e.g. 'cfo@acme.example')."),
+          .describe(
+            "Identity of the approver (lowercase email or label, e.g. 'cfo@acme.example')."
+          ),
         approvedActionType: z
           .string()
           .describe("The action_type being approved (must match a recorded action)."),
@@ -910,7 +978,9 @@ async function main(): Promise<void> {
           .describe("Path to the sealed .sequesign package directory (the receipt to approve)."),
         approverId: z
           .string()
-          .describe("Identity of the approver (lowercase email or label, e.g. 'reviewer@acme.example')."),
+          .describe(
+            "Identity of the approver (lowercase email or label, e.g. 'reviewer@acme.example')."
+          ),
         approvedActionType: z
           .string()
           .describe("The action_type being approved (must match an action in the sealed receipt)."),
@@ -1009,7 +1079,9 @@ async function main(): Promise<void> {
       inputSchema: {
         packageDirectory: z
           .string()
-          .describe("Path to the sealed .sequesign package directory (the receipt to countersign)."),
+          .describe(
+            "Path to the sealed .sequesign package directory (the receipt to countersign)."
+          ),
         counterpartyId: z
           .string()
           .describe(
@@ -1142,7 +1214,9 @@ async function main(): Promise<void> {
       inputSchema: {
         packageDirectory: z
           .string()
-          .describe("Path to the .sequesign package directory (the actions/evidence/keys live here)."),
+          .describe(
+            "Path to the .sequesign package directory (the actions/evidence/keys live here)."
+          ),
         receiptUrl: z
           .string()
           .optional()
@@ -1218,11 +1292,18 @@ async function main(): Promise<void> {
                 })`;
               }
             }
+            // Template system Phase 5: author anchor (grades template_authenticity).
+            // Best-effort like registration — a down endpoint just leaves the grade
+            // at unrecognized/unattested; it never fails the receipt. An empty
+            // published document (no authors configured) parses to [] and is passed
+            // through as no trusted authors.
+            const trustedAuthorKeys = await fetchAuthorAnchor(config, fetchText);
             const report = await verifyReceiptPackage(args.packageDirectory, {
               envelopePath,
               trustedWitnessKeys,
               trustAnchorMode: "external",
-              ...(trustedRegistrationKeys ? { trustedRegistrationKeys } : {})
+              ...(trustedRegistrationKeys ? { trustedRegistrationKeys } : {}),
+              ...(trustedAuthorKeys ? { trustedAuthorKeys } : {})
             });
             return ok({
               source: "stored_receipt",
@@ -1290,10 +1371,18 @@ async function main(): Promise<void> {
           trustAnchorMode = "self";
         }
 
+        // Template system Phase 5: author anchor (grades template_authenticity).
+        // Fetched only when the caller opts into anchors, best-effort like the
+        // registration anchor above.
+        const trustedAuthorKeys = args.fetchAnchors
+          ? await fetchAuthorAnchor(config, fetchText)
+          : undefined;
+
         const report: VerificationReport = await verifyReceiptPackage(args.packageDirectory, {
           trustedWitnessKeys,
           trustAnchorMode,
-          ...(trustedRegistrationKeys ? { trustedRegistrationKeys } : {})
+          ...(trustedRegistrationKeys ? { trustedRegistrationKeys } : {}),
+          ...(trustedAuthorKeys ? { trustedAuthorKeys } : {})
         });
 
         return ok({
@@ -1310,12 +1399,176 @@ async function main(): Promise<void> {
     }
   );
 
+  // -------------------------------------------------------------------------
+  // Template system Phase 6: read-only template discovery + pre-flight tools.
+  // All three read the bundled registry offline and never touch session state,
+  // the network, or secrets.
+  // -------------------------------------------------------------------------
+
+  // Summarize one registry profile for discovery: identity, tier, the parameters
+  // a caller must bind, and whether it carries a template-author signature.
+  async function summarizeTemplate(profileId: string) {
+    const loaded = await loadProfileById(profileId);
+    if (!loaded) return null;
+    const doc = loaded.profile as Record<string, unknown>;
+    const rawParams =
+      doc.parameters && typeof doc.parameters === "object" && !Array.isArray(doc.parameters)
+        ? (doc.parameters as Record<
+            string,
+            { type?: unknown; required?: unknown; default?: unknown }
+          >)
+        : {};
+    const parameters = Object.entries(rawParams).map(([name, d]) => ({
+      name,
+      type: typeof d?.type === "string" ? d.type : "unknown",
+      required: d?.required === true,
+      has_default: d != null && Object.prototype.hasOwnProperty.call(d, "default")
+    }));
+    return {
+      profile_id: loaded.profileId,
+      tier: loaded.tier,
+      description: typeof doc.description === "string" ? doc.description : null,
+      receipt_mode: typeof doc.receipt_mode === "string" ? doc.receipt_mode : null,
+      profile_hash: loaded.profileHash,
+      author_signed: loaded.authorSignature != null,
+      allowed_actions: Array.isArray(doc.allowed_actions) ? doc.allowed_actions : [],
+      required_actions: Array.isArray(doc.required_actions) ? doc.required_actions : [],
+      parameters
+    };
+  }
+
+  server.registerTool(
+    "sequesign_list_templates",
+    {
+      title: "List workflow templates",
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false
+      },
+      description:
+        "List the bundled Sequesign workflow templates (profiles) available for profile_constrained sessions. Each entry gives the profile_id (pass it to sequesign_start_session), its curation tier (official | verified | community | experimental — discovery metadata, NOT a security control), description, the parameters you must bind, allowed/required actions, and whether the template is author-signed. Optionally filter by tier.",
+      inputSchema: {
+        tier: z
+          .enum(["official", "verified", "community", "experimental"])
+          .optional()
+          .describe("Only return templates in this curation tier.")
+      }
+    },
+    async (args) => {
+      try {
+        const manifest = await loadManifest();
+        const summaries = [];
+        for (const entry of manifest.profiles) {
+          if (args.tier && resolveTemplateTier(entry.tier) !== args.tier) continue;
+          const summary = await summarizeTemplate(entry.profile_id);
+          if (summary) summaries.push(summary);
+        }
+        return ok({ count: summaries.length, templates: summaries });
+      } catch (error) {
+        return fail(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    "sequesign_get_template",
+    {
+      title: "Get a workflow template",
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false
+      },
+      description:
+        "Fetch one bundled workflow template by profile_id: its full profile document (allowed_actions, required_actions, allowed_transitions, parameters, conditional_requirements, required_attestations, and any evidence_schemas), plus its profile_hash, curation tier, and whether it is author-signed. Use this to learn a template's rules before starting a profile_constrained session or before sequesign_check_action.",
+      inputSchema: {
+        profileId: z
+          .string()
+          .describe("The template's profile_id (e.g. from sequesign_list_templates).")
+      }
+    },
+    async (args) => {
+      try {
+        const loaded = await loadProfileById(args.profileId);
+        if (!loaded) {
+          return fail(
+            `Unknown template profile_id: "${args.profileId}". Call sequesign_list_templates to see the available templates.`
+          );
+        }
+        const summary = await summarizeTemplate(args.profileId);
+        return ok({ ...summary, profile: loaded.profile });
+      } catch (error) {
+        return fail(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    "sequesign_check_action",
+    {
+      title: "Check an action against a template",
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false
+      },
+      description:
+        "Pre-flight a single action against a workflow template BEFORE recording it, so you learn a violation up front instead of in the finalized receipt's conformance report. Given a template (profileId), the action type, the session's bound parameters, and optionally the actions already recorded (priorActionTypes) and a draft evidence object, it reports: whether the action is allowed, whether the transition is valid, any parameter-binding errors, the concrete evidence schema for this action (with $param/$allowlist resolved against your params), and — if you pass evidence — whether that evidence satisfies the mandate. This is the pure complement to sequesign_verify's post-hoc conformance grade; it is advisory and never records anything.",
+      inputSchema: {
+        profileId: z
+          .string()
+          .describe("The template's profile_id to check against (from sequesign_list_templates)."),
+        actionType: z.string().describe("The action type you intend to record next."),
+        params: z
+          .record(z.any())
+          .optional()
+          .describe(
+            "The parameter values you would bind at session start, bound against the template's `parameters` block (same rules as sequesign_start_session). Required if the template declares required parameters."
+          ),
+        priorActionTypes: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "The action types already recorded on the chain, in order. Supply to check the transition into actionType (START -> actionType for an empty array). Omit to skip the transition check."
+          ),
+        evidence: z
+          .any()
+          .optional()
+          .describe(
+            "A draft evidence object for the action. When the template declares an evidence_schema for actionType, the evidence is validated against the resolved schema and evidenceValid is reported."
+          )
+      }
+    },
+    async (args) => {
+      try {
+        const loaded = await loadProfileById(args.profileId);
+        if (!loaded) {
+          return fail(
+            `Unknown template profile_id: "${args.profileId}". Call sequesign_list_templates to see the available templates.`
+          );
+        }
+        const result = checkAction({
+          profile: loaded.profile as Record<string, unknown>,
+          actionType: args.actionType,
+          params: args.params,
+          priorActionTypes: args.priorActionTypes,
+          evidence: args.evidence
+        });
+        return ok({ profile_id: loaded.profileId, action_type: args.actionType, ...result });
+      } catch (error) {
+        return fail(error);
+      }
+    }
+  );
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // stdout is the MCP transport; log lifecycle to stderr only.
-  process.stderr.write(
-    `sequesign-mcp ready (mode=${config.mode}, witness=${config.witnessUrl})\n`
-  );
+  process.stderr.write(`sequesign-mcp ready (mode=${config.mode}, witness=${config.witnessUrl})\n`);
 }
 
 main().catch((error) => {
