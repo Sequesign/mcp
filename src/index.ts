@@ -458,6 +458,14 @@ function summarizeVerification(report: VerificationReport) {
     verification_level: report.verification_level,
     trust_anchor_mode: report.trust_anchor_mode,
     flags: report.flags,
+    // Lifted out of `flags` / the nested report so the two most-asked axes are
+    // visible at the top of the summary: whether an independent witness signed
+    // the seal, and which trusted witness key matched (null when unwitnessed or
+    // self-checked). The final chain-state hash is the tip of the hash chain the
+    // whole record links back to.
+    witnessed: report.flags?.witnessed ?? null,
+    witness_key_id: report.witness_trust_anchor?.matched_key_id ?? null,
+    final_chain_state: report.chain?.final_chain_state ?? null,
     identity_assurance: report.identity_assurance ?? null,
     agent_identity: report.agent_identity?.kind ?? null,
     // Phase 4: the mandate/conformance axis, distinct from `valid`. `conformant`
@@ -624,6 +632,11 @@ async function main(): Promise<void> {
         // action's schema). No profile → freeform (the default, unchanged).
         let receiptMode: ReceiptMode = "freeform";
         let profileRef: ProfileReference | undefined;
+        // The template's action allow-list, captured for the bind response so the
+        // caller can see what rules were just fixed (the hash and params are on
+        // profileRef / args.params). null for a freeform session.
+        let profileActions: { allowed_actions: unknown[]; required_actions: unknown[] } | null =
+          null;
         if (args.profile) {
           const loaded = await loadProfileById(args.profile);
           if (!loaded) {
@@ -633,6 +646,11 @@ async function main(): Promise<void> {
           }
           receiptMode = "profile_constrained";
           profileRef = { profile_id: loaded.profileId, profile_hash: loaded.profileHash };
+          const doc = loaded.profile as Record<string, unknown>;
+          profileActions = {
+            allowed_actions: Array.isArray(doc.allowed_actions) ? doc.allowed_actions : [],
+            required_actions: Array.isArray(doc.required_actions) ? doc.required_actions : []
+          };
         }
         // Parameters bind to a profile: reject params without one up front with a
         // clear message (the SDK also enforces this, but a pre-check reads better
@@ -686,6 +704,22 @@ async function main(): Promise<void> {
           chainId: session.chainId,
           mode: session.mode,
           transport: effectiveMode,
+          // The rules fixed at bind time, echoed so the caller can see what was
+          // committed before any work happened: the template's id + hash, its
+          // action allow-list, and the concrete parameter values bound into it
+          // (e.g. the amount cap). profile_hash and the params are committed into
+          // the chain genesis (genesis_chain_state below is that root).
+          ...(profileRef
+            ? { profile_id: profileRef.profile_id, profile_hash: profileRef.profile_hash }
+            : {}),
+          ...(profileActions
+            ? {
+                allowed_actions: profileActions.allowed_actions,
+                required_actions: profileActions.required_actions
+              }
+            : {}),
+          ...(args.params !== undefined ? { bound_parameters: args.params } : {}),
+          genesis_chain_state: session.state.currentChainState,
           // In managed mode the registered key is always used; ephemeral only
           // happens in direct mode with no SEQUESIGN_AGENT_PRIVATE_KEY set.
           ephemeral_agent_key: effectiveMode === "direct" && !config.agentPrivateKeyPem,
@@ -789,7 +823,17 @@ async function main(): Promise<void> {
           actionId: recorded.actionId,
           actionType: recorded.actionType,
           sequence: recorded.sequence,
+          // The evidence the caller supplied, echoed back so the recorded facts
+          // (e.g. invoice number, amount, PO match) are visible alongside their
+          // hash — the raw bytes live in the on-disk evidence file, this is a
+          // convenience copy, not a second source of truth.
+          evidence: args.evidence,
           evidenceHash: recorded.evidenceHash,
+          // The explicit hash link: this action's record hashes to
+          // actionRecordHash and advances the chain from previousChainState to
+          // chainState. Reordering or deleting any action breaks this link.
+          previousChainState: recorded.previousChainState,
+          actionRecordHash: recorded.actionRecordHash,
           chainState: recorded.chainState,
           ...(schemaFields.schemaId ? { schemaId: schemaFields.schemaId } : {})
         });
@@ -1191,6 +1235,13 @@ async function main(): Promise<void> {
           receiptId: result.receiptId,
           package_directory: open.packageDirectory,
           receipt_url: result.receiptUrl ?? null,
+          // The headline seal outcome, lifted to the top level (also inside
+          // `verification`): did the work obey the mandate, was the seal
+          // independently witnessed, and the final chain-state hash the whole
+          // record links back to.
+          conformant: result.verification.conformant ?? null,
+          witnessed: result.verification.flags?.witnessed ?? null,
+          final_chain_state: result.finalChainState,
           verification: summarizeVerification(result.verification)
         });
       } catch (error) {
