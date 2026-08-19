@@ -699,6 +699,23 @@ async function main(): Promise<void> {
           queue: Promise.resolve()
         });
 
+        // The parameters actually committed into the genesis: the SDK resolves
+        // the caller's params against the template's declarations (applying
+        // defaults, e.g. currency: "USD") and writes the resolved set to the
+        // package's params.json. Echo that authoritative set, not the raw input,
+        // so bound_parameters matches what params_hash commits. Fall back to the
+        // raw input if the file is unreadable.
+        let boundParameters: Record<string, unknown> | undefined;
+        if (args.params !== undefined) {
+          try {
+            boundParameters = JSON.parse(
+              await readFile(path.join(packageDirectory, "params.json"), "utf8")
+            ) as Record<string, unknown>;
+          } catch {
+            boundParameters = args.params;
+          }
+        }
+
         return ok({
           sessionId: session.receiptId,
           chainId: session.chainId,
@@ -718,7 +735,7 @@ async function main(): Promise<void> {
                 required_actions: profileActions.required_actions
               }
             : {}),
-          ...(args.params !== undefined ? { bound_parameters: args.params } : {}),
+          ...(boundParameters !== undefined ? { bound_parameters: boundParameters } : {}),
           genesis_chain_state: session.state.currentChainState,
           // In managed mode the registered key is always used; ephemeral only
           // happens in direct mode with no SEQUESIGN_AGENT_PRIVATE_KEY set.
