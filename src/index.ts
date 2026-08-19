@@ -451,6 +451,35 @@ function fail(error: unknown): ToolResult {
   return { content: [{ type: "text", text: `Error: ${message}` }], isError: true };
 }
 
+// Resolve the bound-parameter set the SDK commits into params_hash: for each
+// declared template parameter, the caller's supplied value if present, else the
+// declared default. Mirrors bindParameters' provided-or-default selection so the
+// bind response echoes what was actually committed (defaults applied, e.g.
+// currency: "USD"), independent of transport and without depending on the
+// package's params.json (which the managed path does not write until
+// inspect/finalize). A valid session has no undeclared parameters — bindParameters
+// rejects those at startSession — so the declared params are the whole set.
+function resolveBoundParameters(
+  declarations: Record<string, unknown> | null,
+  provided: Record<string, unknown>
+): Record<string, unknown> {
+  const decls = declarations ?? {};
+  const out: Record<string, unknown> = {};
+  for (const [name, decl] of Object.entries(decls)) {
+    if (Object.prototype.hasOwnProperty.call(provided, name)) {
+      out[name] = provided[name];
+    } else if (
+      decl !== null &&
+      typeof decl === "object" &&
+      "default" in decl &&
+      (decl as { default?: unknown }).default !== undefined
+    ) {
+      out[name] = (decl as { default: unknown }).default;
+    }
+  }
+  return out;
+}
+
 function summarizeVerification(report: VerificationReport) {
   return {
     valid: report.valid,
@@ -637,6 +666,12 @@ async function main(): Promise<void> {
         // profileRef / args.params). null for a freeform session.
         let profileActions: { allowed_actions: unknown[]; required_actions: unknown[] } | null =
           null;
+        // The template's parameter declarations, captured so the bind response can
+        // echo the RESOLVED committed set (provided values + declared defaults) —
+        // the same set the SDK's bindParameters commits into params_hash. Read from
+        // the profile so it works in both direct and managed mode (managed does not
+        // write params.json until inspect/finalize). null for a freeform session.
+        let profileParamDecls: Record<string, unknown> | null = null;
         if (args.profile) {
           const loaded = await loadProfileById(args.profile);
           if (!loaded) {
@@ -651,6 +686,10 @@ async function main(): Promise<void> {
             allowed_actions: Array.isArray(doc.allowed_actions) ? doc.allowed_actions : [],
             required_actions: Array.isArray(doc.required_actions) ? doc.required_actions : []
           };
+          profileParamDecls =
+            doc.parameters && typeof doc.parameters === "object" && !Array.isArray(doc.parameters)
+              ? (doc.parameters as Record<string, unknown>)
+              : {};
         }
         // Parameters bind to a profile: reject params without one up front with a
         // clear message (the SDK also enforces this, but a pre-check reads better
@@ -699,22 +738,17 @@ async function main(): Promise<void> {
           queue: Promise.resolve()
         });
 
-        // The parameters actually committed into the genesis: the SDK resolves
-        // the caller's params against the template's declarations (applying
-        // defaults, e.g. currency: "USD") and writes the resolved set to the
-        // package's params.json. Echo that authoritative set, not the raw input,
-        // so bound_parameters matches what params_hash commits. Fall back to the
-        // raw input if the file is unreadable.
-        let boundParameters: Record<string, unknown> | undefined;
-        if (args.params !== undefined) {
-          try {
-            boundParameters = JSON.parse(
-              await readFile(path.join(packageDirectory, "params.json"), "utf8")
-            ) as Record<string, unknown>;
-          } catch {
-            boundParameters = args.params;
-          }
-        }
+        // The parameters actually committed into the genesis: for each declared
+        // template parameter, the caller's value if supplied, else the declared
+        // default. This mirrors what the SDK's bindParameters commits into
+        // params_hash (defaults applied, e.g. currency: "USD"), so bound_parameters
+        // reflects the committed mandate rather than the caller's partial input.
+        // Derived from the profile declarations so it is correct in both direct and
+        // managed mode (managed does not write params.json until inspect/finalize).
+        const boundParameters =
+          args.params !== undefined
+            ? resolveBoundParameters(profileParamDecls, args.params)
+            : undefined;
 
         return ok({
           sessionId: session.receiptId,
