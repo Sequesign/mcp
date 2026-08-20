@@ -9,8 +9,10 @@
 # Prerequisites (see PUBLISHING.md):
 #   - @sequesign/sdk@<the version this package depends on> is ALREADY on npm
 #     (published from its own pipeline) — npm ci/build/publish here needs it;
-#   - the `@sequesign` npm scope + an `NPM_TOKEN` repo secret (or npm Trusted
-#     Publishing configured for this repo/workflow, which drops the token);
+#   - the `@sequesign` npm scope with npm Trusted Publishing configured for this
+#     repo + workflow (Settings -> Trusted Publisher on the package). Auth is via
+#     GitHub OIDC (id-token:write below) — no NPM_TOKEN secret, and the minted
+#     short-lived token satisfies the package's 2FA requirement;
 #   - the `io.github.Sequesign/*` registry namespace is proven automatically by
 #     `mcp-publisher login github-oidc` (same GitHub org → no DNS/secret).
 
@@ -47,8 +49,9 @@ jobs:
       # (re)publish the MCP registry metadata after the npm publish already
       # succeeded), skip the npm publish instead of failing on a version clash.
       - name: Publish to npm (with provenance)
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # Auth via npm Trusted Publishing (OIDC) — same as publish-sdk.yml. The
+        # id-token:write permission above lets npm mint a short-lived token that
+        # also satisfies the package's 2FA requirement. No NPM_TOKEN secret.
         run: |
           VER="$(node -p "require('./package.json').version")"
           if npm view "@sequesign/mcp@${VER}" version >/dev/null 2>&1; then
