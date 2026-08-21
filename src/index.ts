@@ -62,8 +62,12 @@ import {
   loadManifest,
   loadSchemaByActionType,
   loadSchemaById,
-  resolveTemplateTier,
-  checkAction
+  checkAction,
+  validateJsonSchema,
+  createTemplateResolver,
+  remoteTemplateSource,
+  bundledTemplateSource,
+  inMemoryTemplateCache
 } from "@sequesign/sdk";
 import type {
   AgentActionReceipt,
@@ -74,6 +78,9 @@ import type {
   Sdk,
   Session,
   SessionInit,
+  TemplateResolver,
+  LoadedTemplate,
+  JsonSchema,
   VerificationReport,
   VerifiabilityClass
 } from "@sequesign/sdk";
@@ -126,6 +133,13 @@ interface Config {
   tier: "hosted" | "hash-only" | "ephemeral";
   agentPrivateKeyPem?: string;
   packageBaseDir: string;
+  // Optional dynamic template registry (Phase 2). When set, direct-mode sessions
+  // and the discovery tools resolve templates from this read-only registry base
+  // URL first, falling back to the bundled templates offline. Unset -> today's
+  // behavior (bundled-only). The optional token is a read-only discovery
+  // credential for an account-scoped registry; it is never used in verification.
+  templateRegistryUrl?: string;
+  templateRegistryToken?: string;
 }
 
 // The API key may only be sent to receipt-store origins the operator
@@ -192,6 +206,11 @@ function env(name: string): string | undefined {
   return v !== undefined && v.trim().length > 0 ? v : undefined;
 }
 
+// Bound on each dynamic-registry HTTP request (manifest / profile / signature),
+// so a registry that accepts the connection but stalls degrades promptly to the
+// bundled templates instead of hanging on Node's default network timeout.
+const REGISTRY_REQUEST_TIMEOUT_MS = 5000;
+
 function loadConfig(): Config {
   const mode = (env("SEQUESIGN_MODE") ?? "direct") as Mode;
   if (mode !== "direct" && mode !== "managed") {
@@ -215,7 +234,14 @@ function loadConfig(): Config {
     apiKey: env("SEQUESIGN_API_KEY"),
     tier,
     agentPrivateKeyPem: env("SEQUESIGN_AGENT_PRIVATE_KEY"),
-    packageBaseDir: env("SEQUESIGN_PACKAGE_DIR") ?? path.join(tmpdir(), "sequesign-mcp")
+    packageBaseDir: env("SEQUESIGN_PACKAGE_DIR") ?? path.join(tmpdir(), "sequesign-mcp"),
+    // Optional; absent -> bundled-only resolution (unchanged). Trailing slashes
+    // are trimmed so the SDK's remoteTemplateSource joins "manifest.json" cleanly.
+    templateRegistryUrl: (() => {
+      const u = env("SEQUESIGN_TEMPLATE_REGISTRY_URL");
+      return u ? trimUrl(u) : undefined;
+    })(),
+    templateRegistryToken: env("SEQUESIGN_TEMPLATE_REGISTRY_TOKEN")
   };
   // Fail fast when the DEFAULT mode is managed but its secrets are missing.
   // (A per-call mode:"managed" override is validated again in start_session.)
@@ -232,8 +258,13 @@ function loadConfig(): Config {
 // witness too: the hosted witness authenticates the signing POST, so an
 // unauthenticated direct call is rejected — the key authenticates/meters the
 // request without making the (independent) witness any less independent.
-function buildSdk(config: Config, mode: Mode): Sdk {
+function buildSdk(config: Config, mode: Mode, templateResolver?: TemplateResolver): Sdk {
   if (mode === "managed") {
+    // Managed mode intentionally does NOT receive templateResolver: the broker
+    // owns template resolution (it re-resolves the profile from its own registry),
+    // so a client-side resolver here would have no effect and could only create a
+    // false expectation. Dynamic-registry support in managed mode is a broker-side
+    // change, tracked separately.
     return createSequesign({
       mode: "managed",
       tier: config.tier,
@@ -242,7 +273,9 @@ function buildSdk(config: Config, mode: Mode): Sdk {
   }
   return createSequesign({
     mode: "direct",
-    witness: { baseUrl: config.witnessUrl, ...(config.apiKey ? { apiKey: config.apiKey } : {}) }
+    witness: { baseUrl: config.witnessUrl, ...(config.apiKey ? { apiKey: config.apiKey } : {}) },
+    // Default (undefined) preserves bundled-only resolution — identical to before.
+    ...(templateResolver ? { templateResolver } : {})
   });
 }
 
@@ -578,13 +611,130 @@ async function fetchAuthorAnchor(
 async function main(): Promise<void> {
   const config = loadConfig();
 
+  // Dynamic template registry (Phase 2). Built once when a registry URL is
+  // configured. Precedence is BUNDLED-FIRST: the registry ADDS templates that are
+  // not shipped in the SDK, but never overrides a bundled id. That keeps the model
+  // simple and safe — a registry cannot silently replace a shipped, trusted
+  // template, and there is no colliding-id ambiguity between what discovery shows
+  // and what a session binds (a bundled id always resolves bundled everywhere; a
+  // non-bundled id resolves from the registry). Trust stays local — the resolver
+  // recomputes profile_hash, honors pins, and validates identity (see
+  // @sequesign/sdk template-source). Unset -> undefined, and every path below
+  // behaves exactly as before (bundled-only).
+  const templateResolver: TemplateResolver | undefined = config.templateRegistryUrl
+    ? createTemplateResolver({
+        sources: [
+          // Bundled FIRST: a bundled id wins; the registry is consulted only for
+          // ids the SDK does not ship.
+          bundledTemplateSource(),
+          remoteTemplateSource({
+            baseUrl: config.templateRegistryUrl,
+            fetchImpl: globalThis.fetch,
+            // Bound each registry request so a registry that accepts the
+            // connection but stalls degrades promptly instead of hanging on Node's
+            // much longer default network timeout.
+            requestTimeoutMs: REGISTRY_REQUEST_TIMEOUT_MS,
+            ...(config.templateRegistryToken ? { token: config.templateRegistryToken } : {})
+          })
+        ],
+        cache: inMemoryTemplateCache()
+      })
+    : undefined;
+
+  // The discovery tools (list/get/check) reach the configured registry over the
+  // network when one is set — an authenticated request that discloses the registry
+  // token and the requested profile_id. That is an open-world operation, so their
+  // openWorldHint tracks whether a registry is configured: true when it is (network
+  // calls possible), false when it is not (purely local, bundled-only — unchanged
+  // from before this feature). MCP clients that gate on the hint see network-capable
+  // tools flagged accurately.
+  const registryConfigured = Boolean(config.templateRegistryUrl);
+
+  // Resolve a template by profile_id. Discovery reads (list/get/check) consult the
+  // registry (bundled-first) when configured; the start_session pre-flight passes
+  // allowRemote only for DIRECT sessions, because managed sessions are resolved by
+  // the broker from ITS registry — resolving a non-bundled template here would
+  // compute a hash the broker cannot reproduce. Bundled-only resolution is the
+  // fallback in both cases, so behavior is unchanged when no registry is set.
+  const resolveTemplate = async (
+    profileId: string,
+    allowRemote = true
+  ): Promise<LoadedTemplate | Awaited<ReturnType<typeof loadProfileById>>> => {
+    if (templateResolver && allowRemote) return templateResolver.resolveProfile(profileId);
+    return loadProfileById(profileId);
+  };
+
+  // The configured registry's published catalog, from a SINGLE manifest fetch, for
+  // discovery listing. Returns manifest-level metadata only (id, tier, whether a
+  // signature sidecar is advertised) — NOT the profile documents: a catalog listing
+  // must not fetch every document (that would be 1 + N requests and amplify a
+  // stalled registry into N timeouts). Full detail for one template comes from
+  // sequesign_get_template, and binding always goes through the trusted resolver.
+  // Returns [] when no registry is configured or the manifest can't be fetched /
+  // parsed, so discovery degrades to the bundled set. Logs to stderr (stdout is the
+  // MCP protocol channel).
+  type RemoteManifestEntry = { profile_id: string; tier?: string; signed: boolean };
+  const listRemoteManifest = async (): Promise<RemoteManifestEntry[]> => {
+    if (!config.templateRegistryUrl) return [];
+    try {
+      const headers: Record<string, string> = { accept: "application/json" };
+      if (config.templateRegistryToken)
+        headers.authorization = `Bearer ${config.templateRegistryToken}`;
+      const res = await globalThis.fetch(`${config.templateRegistryUrl}/manifest.json`, {
+        headers,
+        // Bound the one fetch so a stalled registry degrades promptly to bundled.
+        signal: AbortSignal.timeout(REGISTRY_REQUEST_TIMEOUT_MS)
+      });
+      if (!res.ok) return [];
+      const body = (await res.json()) as {
+        profiles?: Array<{ profile_id?: unknown; tier?: unknown; signature_path?: unknown }>;
+      };
+      if (!Array.isArray(body.profiles)) return [];
+      return body.profiles
+        .filter((p) => typeof p?.profile_id === "string")
+        .map((p) => ({
+          profile_id: p.profile_id as string,
+          tier: typeof p.tier === "string" ? p.tier : undefined,
+          signed: typeof p.signature_path === "string" && p.signature_path.length > 0
+        }));
+    } catch (err) {
+      console.error(
+        `sequesign-mcp: could not fetch template registry manifest for listing: ${String(err)}`
+      );
+      return [];
+    }
+  };
+
+  // Curation tiers the discovery output uses; an unknown value from a remote
+  // manifest normalizes to "community" so it never escapes the known set.
+  const KNOWN_TIERS = new Set(["official", "verified", "community", "experimental"]);
+  const normalizeTier = (t: unknown): string =>
+    typeof t === "string" && KNOWN_TIERS.has(t) ? t : "community";
+
+  // The action types the consumer can actually record against — the bundled
+  // schema set. A profile_constrained session resolves each action's schema via
+  // bundled loadSchemaByActionType at record time, so an allowed_action with no
+  // bundled schema is rejected ("No registered schema") after the session opens.
+  const bundledActionTypes = async (): Promise<Set<string>> =>
+    new Set((await loadManifest()).schemas.map((s) => s.action_type));
+
+  // allowed_actions of `doc` that have NO bundled schema (empty = all resolvable).
+  // Bundled templates ship with their schemas, so this only gates REMOTE templates:
+  // a remote template referencing a non-bundled action type is unusable (its
+  // actions cannot be recorded), even though the profile itself resolves.
+  const unresolvableActions = (doc: Record<string, unknown>, bundled: Set<string>): string[] => {
+    const actions = Array.isArray(doc.allowed_actions) ? doc.allowed_actions : [];
+    return actions.filter((a): a is string => typeof a === "string" && !bundled.has(a));
+  };
+
   // One SDK per mode, built on first use. Lets a single server run both
   // direct and managed sessions (chosen per call) without re-reading config.
   const sdkByMode = new Map<Mode, Sdk>();
   const getSdk = (mode: Mode): Sdk => {
     let sdk = sdkByMode.get(mode);
     if (!sdk) {
-      sdk = buildSdk(config, mode);
+      // Only direct-mode sessions receive the resolver (see buildSdk).
+      sdk = buildSdk(config, mode, templateResolver);
       sdkByMode.set(mode, sdk);
     }
     return sdk;
@@ -673,15 +823,52 @@ async function main(): Promise<void> {
         // write params.json until inspect/finalize). null for a freeform session.
         let profileParamDecls: Record<string, unknown> | null = null;
         if (args.profile) {
-          const loaded = await loadProfileById(args.profile);
+          // A template may be resolved from the configured registry ONLY on the
+          // parameterized (V1) path: a direct session WITH params. That mirrors the
+          // SDK exactly — genesis-binding resolves via the caller's resolver only on
+          // the V1 path (where the profile_hash is committed into the signed genesis
+          // and the embedded profile.json is genesis-authenticated). The V0 path
+          // (no params) and managed mode both resolve bundled-only, so a remote-only
+          // template bound without params would otherwise resolve here at pre-flight
+          // yet fail later as unknown_profile (its V0 embedded profile is not
+          // authenticated, and the offline verifier / broker have only the bundled
+          // registry). Gating the pre-flight the same way rejects it up front,
+          // before any work is recorded.
+          const allowRemote = effectiveMode === "direct" && args.params !== undefined;
+          const loaded = await resolveTemplate(args.profile, allowRemote);
           if (!loaded) {
             throw new Error(
-              `Unknown template "${args.profile}". It must be a registered template's profile_id in the bundled registry (e.g. "sequesign.invoice_payment.v0.1").`
+              `Unknown template "${args.profile}". It must be a registered template's profile_id from ` +
+                `the bundled registry, or — for a template published only to the configured registry ` +
+                `(SEQUESIGN_TEMPLATE_REGISTRY_URL, direct mode) — you must also pass \`params\` so the ` +
+                `session is parameterized and its profile is committed into the signed genesis and ` +
+                `travels in the receipt (an unparameterized remote template cannot be verified offline). ` +
+                `Example bundled id: "sequesign.invoice_payment.v0.1".`
             );
+          }
+          const doc = loaded.profile as Record<string, unknown>;
+          // A REMOTE template must compose bundled action schemas: record_action
+          // resolves each action's schema via bundled loadSchemaByActionType, so an
+          // allowed_action with no bundled schema would let the session open but
+          // reject every conformant action ("No registered schema") afterwards.
+          // Reject at pre-flight, before any work is recorded. (Bundled templates
+          // ship with their schemas, so this only gates registry-resolved ones.)
+          if (
+            (loaded as { source?: string }).source &&
+            (loaded as { source?: string }).source !== "bundled"
+          ) {
+            const missing = unresolvableActions(doc, await bundledActionTypes());
+            if (missing.length > 0) {
+              throw new Error(
+                `Template "${args.profile}" from the registry declares action type(s) with no bundled ` +
+                  `schema: ${missing.join(", ")}. Its actions cannot be recorded (schemas resolve from ` +
+                  `the bundled registry), so the template is not usable by this MCP build. Use a template ` +
+                  `whose actions are all registered in the bundled schema set.`
+              );
+            }
           }
           receiptMode = "profile_constrained";
           profileRef = { profile_id: loaded.profileId, profile_hash: loaded.profileHash };
-          const doc = loaded.profile as Record<string, unknown>;
           profileActions = {
             allowed_actions: Array.isArray(doc.allowed_actions) ? doc.allowed_actions : [],
             required_actions: Array.isArray(doc.required_actions) ? doc.required_actions : []
@@ -1507,12 +1694,27 @@ async function main(): Promise<void> {
   // the network, or secrets.
   // -------------------------------------------------------------------------
 
-  // Summarize one registry profile for discovery: identity, tier, the parameters
-  // a caller must bind, and whether it carries a template-author signature.
-  async function summarizeTemplate(profileId: string) {
-    const loaded = await loadProfileById(profileId);
-    if (!loaded) return null;
-    const doc = loaded.profile as Record<string, unknown>;
+  // Summarize one resolved template for discovery: identity, tier, provenance
+  // (bundled vs a registry source), the parameters a caller must bind, and whether
+  // it carries a template-author signature. Takes an already-resolved template so
+  // a caller that resolved it once does not pay a second lookup.
+  function summarizeTemplate(
+    loaded: {
+      profileId: string;
+      profile: Record<string, unknown>;
+      profileHash: string;
+      authorSignature?: unknown;
+      tier: string;
+      source?: string;
+    },
+    bundledActions: Set<string>,
+    // The transport the session would use. Remote binding is direct-only, so
+    // session_ready for a remote template depends on it. Defaults to the server's
+    // configured mode; callers (get_template) can override to model a specific
+    // intended start mode, matching start_session's per-call mode override.
+    mode: Mode = config.mode
+  ) {
+    const doc = loaded.profile;
     const rawParams =
       doc.parameters && typeof doc.parameters === "object" && !Array.isArray(doc.parameters)
         ? (doc.parameters as Record<
@@ -1526,9 +1728,38 @@ async function main(): Promise<void> {
       required: d?.required === true,
       has_default: d != null && Object.prototype.hasOwnProperty.call(d, "default")
     }));
+    const source = loaded.source ?? "bundled";
+    // Whether start_session can actually bind AND run this template. A bundled
+    // template is always session-ready (its V0 path resolves from the bundled
+    // registry, and its actions ship with bundled schemas). A REMOTE template is
+    // session-ready only if ALL of: the session's transport is DIRECT (start_session
+    // sets allowRemote only in direct mode — a managed session resolves through the
+    // broker and can never bind a registry-only template), it declares usable
+    // parameters (remote binding requires the parameterized V1 path — an
+    // unparameterized remote template resolves bundled-only without params, and the
+    // SDK rejects `params:{}` against a template that declares none), AND every
+    // allowed_action has a bundled schema (record_action resolves schemas
+    // bundled-only, so a non-bundled action is unrecordable). Otherwise browse-only.
+    // `mode` is the intended transport (default: the server's configured mode), so
+    // this stays in lockstep with check_action's startability gate for the same mode.
+    const sessionReady =
+      source === "bundled" ||
+      (mode === "direct" &&
+        parameters.length > 0 &&
+        unresolvableActions(doc, bundledActions).length === 0);
     return {
       profile_id: loaded.profileId,
       tier: loaded.tier,
+      // Provenance: "bundled" for the shipped registry, or the registry source
+      // name ("remote"/"cache") when resolved dynamically. Discovery metadata.
+      source,
+      // This entry carries the full profile detail (parameters/actions), vs a
+      // manifest-level listing entry (see sequesign_list_templates).
+      details_available: true,
+      // Discovery hint: true if start_session can bind AND run it (see above). A
+      // remote template that is unparameterized or uses non-bundled actions is
+      // listed for visibility but is browse-only.
+      session_ready: sessionReady,
       description: typeof doc.description === "string" ? doc.description : null,
       receipt_mode: typeof doc.receipt_mode === "string" ? doc.receipt_mode : null,
       profile_hash: loaded.profileHash,
@@ -1547,10 +1778,12 @@ async function main(): Promise<void> {
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
-        openWorldHint: false
+        // Reaches the configured registry over the network (bundled-only, no network,
+        // when none is configured). See registryConfigured above.
+        openWorldHint: registryConfigured
       },
       description:
-        "List the bundled Sequesign workflow templates (profiles) available for profile_constrained sessions. Each entry gives the profile_id (pass it to sequesign_start_session), its curation tier (official | verified | community | experimental — discovery metadata, NOT a security control), description, the parameters you must bind, allowed/required actions, and whether the template is author-signed. Optionally filter by tier.",
+        "List the Sequesign workflow templates (profiles) available for profile_constrained sessions: the bundled templates (full detail), plus — when a template registry is configured (SEQUESIGN_TEMPLATE_REGISTRY_URL) — templates published to it (manifest-level entries; call sequesign_get_template for a remote template's full detail). Every entry gives the profile_id (pass it to sequesign_start_session), its curation tier (official | verified | community | experimental — discovery metadata, NOT a security control), its source (bundled vs the registry), and details_available (false for remote manifest-level entries). Bundled entries additionally give session_ready (whether start_session can bind AND run it), description, the parameters you must bind, allowed/required actions, and whether the template is author-signed. Optionally filter by tier.",
       inputSchema: {
         tier: z
           .enum(["official", "verified", "community", "experimental"])
@@ -1560,13 +1793,50 @@ async function main(): Promise<void> {
     },
     async (args) => {
       try {
-        const manifest = await loadManifest();
-        const summaries = [];
-        for (const entry of manifest.profiles) {
-          if (args.tier && resolveTemplateTier(entry.tier) !== args.tier) continue;
-          const summary = await summarizeTemplate(entry.profile_id);
-          if (summary) summaries.push(summary);
+        // Bundled templates: full local summaries (no network). Remote templates:
+        // manifest-level entries from a SINGLE manifest fetch — a catalog listing
+        // must not fetch every document (that is 1 + N requests and amplifies a
+        // stalled registry into N timeouts). Full detail for one remote template
+        // comes from sequesign_get_template; binding always goes through the
+        // trusted resolver. A registry fetch failure degrades to bundled-only.
+        const bundledManifest = await loadManifest();
+        const bundledActions = new Set(bundledManifest.schemas.map((s) => s.action_type));
+        const bundledIds = new Set(bundledManifest.profiles.map((e) => e.profile_id));
+
+        const summaries: Array<Record<string, unknown>> = [];
+        // Bundled templates: full local summaries (no network). Bundled-first
+        // precedence means a bundled id always resolves bundled, so listing the
+        // bundled document here matches get_template / check_action / start_session.
+        for (const id of bundledIds) {
+          const loaded = await resolveTemplate(id, false); // bundled-only, local
+          if (!loaded) continue;
+          const summary = summarizeTemplate(loaded, bundledActions);
+          if (args.tier && summary.tier !== args.tier) continue;
+          summaries.push(summary);
         }
+        // Registry templates that the SDK does NOT ship: manifest-level entries from
+        // a SINGLE manifest fetch (a catalog listing must not fetch every document).
+        // An id that is also bundled is skipped — bundled wins, and its full entry
+        // is already listed above. Full remote detail comes from get_template.
+        for (const entry of await listRemoteManifest()) {
+          if (bundledIds.has(entry.profile_id)) continue; // bundled wins (see above)
+          const tier = normalizeTier(entry.tier);
+          if (args.tier && tier !== args.tier) continue;
+          summaries.push({
+            profile_id: entry.profile_id,
+            tier,
+            source: "remote",
+            author_signed: entry.signed,
+            // Manifest-level: parameters/actions/session_ready require the document.
+            details_available: false
+          });
+        }
+        // Stable ordering so the listing is deterministic across calls.
+        summaries.sort((a, b) => {
+          const ai = a.profile_id as string;
+          const bi = b.profile_id as string;
+          return ai < bi ? -1 : ai > bi ? 1 : 0;
+        });
         return ok({ count: summaries.length, templates: summaries });
       } catch (error) {
         return fail(error);
@@ -1582,26 +1852,36 @@ async function main(): Promise<void> {
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
-        openWorldHint: false
+        // Resolves through the registry-capable resolver; network calls when a
+        // registry is configured. See registryConfigured above.
+        openWorldHint: registryConfigured
       },
       description:
-        "Fetch one bundled workflow template by profile_id: its full profile document (allowed_actions, required_actions, allowed_transitions, parameters, conditional_requirements, required_attestations, and any evidence_schemas), plus its profile_hash, curation tier, and whether it is author-signed. Use this to learn a template's rules before starting a profile_constrained session or before sequesign_check_action.",
+        "Fetch one workflow template by profile_id (bundled, or from the configured registry): its full profile document (allowed_actions, required_actions, allowed_transitions, parameters, conditional_requirements, required_attestations, and any evidence_schemas), plus its profile_hash, curation tier, source, session_ready, and whether it is author-signed. session_ready reflects the intended transport (the `mode` argument, else the server's default): a registry template is session_ready only under direct mode. Use this to learn a template's rules before starting a profile_constrained session or before sequesign_check_action.",
       inputSchema: {
         profileId: z
           .string()
-          .describe("The template's profile_id (e.g. from sequesign_list_templates).")
+          .describe("The template's profile_id (e.g. from sequesign_list_templates)."),
+        mode: z
+          .enum(["direct", "managed"])
+          .optional()
+          .describe(
+            "The transport you intend to start the session with (mirrors sequesign_start_session's mode override). Determines session_ready for a registry template — remote binding is direct-only. Defaults to the server's configured mode."
+          )
       }
     },
     async (args) => {
       try {
-        const loaded = await loadProfileById(args.profileId);
+        const loaded = await resolveTemplate(args.profileId);
         if (!loaded) {
           return fail(
             `Unknown template profile_id: "${args.profileId}". Call sequesign_list_templates to see the available templates.`
           );
         }
-        const summary = await summarizeTemplate(args.profileId);
-        return ok({ ...summary, profile: loaded.profile });
+        return ok({
+          ...summarizeTemplate(loaded, await bundledActionTypes(), args.mode ?? config.mode),
+          profile: loaded.profile
+        });
       } catch (error) {
         return fail(error);
       }
@@ -1616,10 +1896,12 @@ async function main(): Promise<void> {
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
-        openWorldHint: false
+        // Resolves the template through the registry-capable resolver; network calls
+        // when a registry is configured. See registryConfigured above.
+        openWorldHint: registryConfigured
       },
       description:
-        "Pre-flight a single action against a workflow template BEFORE recording it, so you learn a violation up front instead of in the finalized receipt's conformance report. Given a template (profileId), the action type, the session's bound parameters, and optionally the actions already recorded (priorActionTypes) and a draft evidence object, it reports: whether the action is allowed, whether the transition is valid, any parameter-binding errors, the concrete evidence schema for this action (with $param/$allowlist resolved against your params), and — if you pass evidence — whether that evidence satisfies the mandate. This is the pure complement to sequesign_verify's post-hoc conformance grade; it is advisory and never records anything.",
+        "Pre-flight a single action against a workflow template BEFORE recording it, so you learn a violation up front instead of in the finalized receipt's conformance report. Given a template (profileId), the action type, the session's bound parameters, and optionally the actions already recorded (priorActionTypes) and a draft evidence object, it reports: whether the action is allowed, whether the transition is valid, any parameter-binding errors, the concrete evidence schema for this action (with $param/$allowlist resolved against your params), whether a session can even be started for this template (startable — false for a registry template that cannot be bound under the intended transport: managed mode, or the template declares no usable parameters, uses a non-bundled action, or you did not pass params for its V1 binding — pass `mode` to model the transport you'll start with); and whether the action is recordable (recordSchemaValid — false when the action type has no registered schema, or supplied evidence does not satisfy that bundled schema). allowed is true only when the template is startable AND the mandate AND the recording gate all pass, so a green pre-flight means the action can actually be recorded. It is advisory and never records anything.",
       inputSchema: {
         profileId: z
           .string()
@@ -1642,12 +1924,19 @@ async function main(): Promise<void> {
           .optional()
           .describe(
             "A draft evidence object for the action. When the template declares an evidence_schema for actionType, the evidence is validated against the resolved schema and evidenceValid is reported."
+          ),
+        mode: z
+          .enum(["direct", "managed"])
+          .optional()
+          .describe(
+            "The transport you intend to start the session with (mirrors sequesign_start_session's mode override). Determines startability for a registry template — remote binding is direct-only. Defaults to the server's configured mode."
           )
       }
     },
     async (args) => {
       try {
-        const loaded = await loadProfileById(args.profileId);
+        const effectiveMode: Mode = args.mode ?? config.mode;
+        const loaded = await resolveTemplate(args.profileId);
         if (!loaded) {
           return fail(
             `Unknown template profile_id: "${args.profileId}". Call sequesign_list_templates to see the available templates.`
@@ -1660,7 +1949,126 @@ async function main(): Promise<void> {
           priorActionTypes: args.priorActionTypes,
           evidence: args.evidence
         });
-        return ok({ profile_id: loaded.profileId, action_type: args.actionType, ...result });
+        // Startability precondition, mirroring start_session. "Recordable" presumes a
+        // session can be started for this template at all. A BUNDLED template is
+        // always startable (its V0 path resolves from the bundled registry) — EXCEPT
+        // when supplied params fail to bind, which start_session rejects. A REMOTE
+        // template is bindable ONLY via the parameterized V1 path, so start_session
+        // requires all of: direct mode, `params` supplied that bind, the template
+        // declares usable parameters, and every allowed_action has a bundled schema.
+        // If any fails, no session can open — so however well this single action
+        // grades, it is not recordable. Reflect that here.
+        const source = (loaded as { source?: string }).source ?? "bundled";
+        let startable: boolean | null = null;
+        const startReasons: string[] = [];
+        if (source !== "bundled") {
+          const doc = loaded.profile as Record<string, unknown>;
+          const rawParams = doc.parameters;
+          const hasUsableParams =
+            rawParams != null &&
+            typeof rawParams === "object" &&
+            !Array.isArray(rawParams) &&
+            Object.keys(rawParams as Record<string, unknown>).length > 0;
+          const missingSchemas = unresolvableActions(doc, await bundledActionTypes());
+          if (effectiveMode !== "direct") {
+            // start_session sets allowRemote only in DIRECT mode; a managed session
+            // resolves templates from the broker's registry, so a registry-only
+            // template cannot be bound in managed mode (it would fail as unknown).
+            // effectiveMode is the intended transport (the `mode` arg, else the
+            // server default), so this models exactly the session the caller means
+            // to open — including a direct-mode override on a managed-default server.
+            startable = false;
+            startReasons.push(
+              `Template "${loaded.profileId}" is published only to the registry, and this pre-flight is for managed mode. Managed sessions resolve templates from the broker, so a registry-only template cannot be started; use direct mode (pass mode:"direct" / run SEQUESIGN_MODE=direct) to bind it via the parameterized V1 path.`
+            );
+          } else if (!hasUsableParams) {
+            startable = false;
+            startReasons.push(
+              `Template "${loaded.profileId}" is published only to the registry and declares no usable parameters, so no session can bind it — a remote template is bound only via the parameterized V1 path. It is browse-only, not recordable.`
+            );
+          } else if (missingSchemas.length > 0) {
+            startable = false;
+            startReasons.push(
+              `Template "${loaded.profileId}" declares action type(s) with no bundled schema: ${missingSchemas.join(", ")}. start_session rejects it, so no session can be opened and this action is not recordable.`
+            );
+          } else if (args.params === undefined) {
+            startable = false;
+            startReasons.push(
+              `Template "${loaded.profileId}" is published only to the registry and is bound only via the parameterized V1 path; pass \`params\` to model a startable session (without params it resolves bundled-only and cannot be started).`
+            );
+          } else if (result.paramErrors.length > 0) {
+            // params supplied but they do not bind (missing required, unknown key,
+            // wrong type). start_session runs the same binding and rejects, so the
+            // session cannot open. The specific binding errors are already in
+            // result.reasons ("Parameter error: …"); flag startable accordingly.
+            startable = false;
+            startReasons.push(
+              `Template "${loaded.profileId}" cannot be started: the supplied params do not bind (see the parameter errors).`
+            );
+          } else {
+            // params supplied AND bind + usable + all actions bundled -> startable via V1.
+            startable = true;
+          }
+        } else if (args.params !== undefined && result.paramErrors.length > 0) {
+          // A BUNDLED parameterized template with non-binding params. Bundled
+          // templates are otherwise always startable (V0), but start_session runs the
+          // same bindParameters and rejects when supplied params do not bind, so model
+          // that here too. (No params / valid params -> startable stays null: always
+          // startable, non-blocking.)
+          startable = false;
+          startReasons.push(
+            `Template "${loaded.profileId}" cannot be started with the supplied params: they do not bind (see the parameter errors).`
+          );
+        }
+        // checkAction grades against the PROFILE's own mandate (allowed_actions,
+        // transitions, and its evidence_schema — mirroring evaluateMandate). But a
+        // profile_constrained session records each action under the BUNDLED action
+        // schema: record_action resolves it via loadSchemaByActionType and the SDK
+        // validates evidence against THAT. So an action the mandate allows is only
+        // actually recordable when a bundled schema exists for it AND any supplied
+        // evidence satisfies that schema. A registry profile can break either half —
+        // allow an action type the SDK ships no schema for (record_action fails "No
+        // registered schema" regardless of evidence, and start_session already
+        // rejects such a template), or carry a more permissive evidence_schema than
+        // the bundled one (a mandate-valid evidence that record_action then rejects).
+        // Reflect the record-time gate here, gated on actionAllowed so we don't pile
+        // a schema reason onto an action the mandate already disallows. Bundled
+        // templates ship consistent schemas, so this only ever adds signal for
+        // registry templates.
+        let recordSchemaValid: boolean | null = null;
+        const recordReasons: string[] = [];
+        if (result.actionAllowed) {
+          const bundledSchema = await loadSchemaByActionType(args.actionType);
+          if (!bundledSchema) {
+            // No registered recording schema -> record_action fails before it even
+            // looks at evidence, so the action is not recordable via this MCP.
+            recordSchemaValid = false;
+            recordReasons.push(
+              `No registered recording schema for action "${args.actionType}"; a profile_constrained session records every action under a bundled schema, so sequesign_record_action would fail. This action is not recordable via this MCP.`
+            );
+          } else if (args.evidence !== undefined) {
+            const v = validateJsonSchema(args.evidence, bundledSchema.schema as JsonSchema);
+            recordSchemaValid = v.valid;
+            if (!v.valid)
+              for (const e of v.errors)
+                recordReasons.push(
+                  `Evidence does not satisfy the recording schema for "${args.actionType}": ${e}`
+                );
+          }
+        }
+        return ok({
+          profile_id: loaded.profileId,
+          action_type: args.actionType,
+          ...result,
+          // The action can be recorded only if a session can start (startable),
+          // the mandate accepts the action, AND the recording schema accepts it.
+          // startable/recordSchemaValid are null when not applicable (bundled
+          // template, or nothing to check); only a definite false blocks.
+          allowed: result.allowed && startable !== false && recordSchemaValid !== false,
+          startable,
+          recordSchemaValid,
+          reasons: [...result.reasons, ...startReasons, ...recordReasons]
+        });
       } catch (error) {
         return fail(error);
       }

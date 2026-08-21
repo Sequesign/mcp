@@ -3,7 +3,7 @@
   "manifest_version": "0.3",
   "name": "sequesign",
   "display_name": "Sequesign",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Cryptographically verifiable receipts of an agent's delegated work, verified offline.",
   "long_description": "Sequesign turns an MCP-capable agent into one that can prove what it did. It opens a signed action chain, records each action (the evidence is hashed and signed), and seals the result into a receipt that an independent witness co-signs. The agent's signing key never leaves the machine — in direct mode the witness only co-signs a hash. Receipts verify offline, support multi-party approval and counterparty attestations, and can be checked against the broker-stored, registered-identity copy.",
   "author": {
@@ -28,7 +28,9 @@
         "SEQUESIGN_MODE": "${user_config.mode}",
         "SEQUESIGN_API_KEY": "${user_config.api_key}",
         "SEQUESIGN_AGENT_PRIVATE_KEY": "${user_config.agent_private_key}",
-        "SEQUESIGN_PACKAGE_DIR": "${user_config.package_dir}"
+        "SEQUESIGN_PACKAGE_DIR": "${user_config.package_dir}",
+        "SEQUESIGN_TEMPLATE_REGISTRY_URL": "${user_config.template_registry_url}",
+        "SEQUESIGN_TEMPLATE_REGISTRY_TOKEN": "${user_config.template_registry_token}"
       }
     }
   },
@@ -104,6 +106,19 @@
       "type": "directory",
       "title": "Receipt package directory",
       "description": "Folder where sealed receipt packages are written. Leave blank to use a temporary directory.",
+      "required": false
+    },
+    "template_registry_url": {
+      "type": "string",
+      "title": "Template registry URL (optional)",
+      "description": "Base URL of a read-only dynamic template registry (e.g. https://dashboard-api.sequesign.com/v1/registry). When set, DIRECT-mode sessions and the discovery tools can resolve templates published there in addition to the bundled ones, falling back to bundled offline. Leave blank to use only the bundled templates (the default). Trust is unchanged: profile_hash is recomputed locally and pins reject substitution.",
+      "required": false
+    },
+    "template_registry_token": {
+      "type": "string",
+      "title": "Template registry token (optional)",
+      "description": "Read-only bearer token for an account-scoped template registry. Discovery only — it is never used in verification. Leave blank for a public registry. Stored in your OS keychain.",
+      "sensitive": true,
       "required": false
     }
   },
